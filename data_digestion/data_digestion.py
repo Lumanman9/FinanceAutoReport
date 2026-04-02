@@ -1,7 +1,9 @@
 import os
 import subprocess
 import argparse
+import io
 import base64
+import io
 import json
 import sys
 import torch
@@ -136,8 +138,62 @@ class DataDigester:
             page_images.append(img)
         return page_images
 
+    def convert_to_images(self, input_file, output_folder):
+        temp_pdf = os.path.join(
+            output_folder, f"{os.path.splitext(os.path.basename(input_file))[0]}.pdf"
+        )
+        pdf_path = self.convert_to_pdf(input_file, temp_pdf)
+        return self.segment_pdf(pdf_path)
+
     def extract_structured_content(self, images):
         raise NotImplementedError("Subclasses must implement extract_structured_content().")
+
+    def process_file(
+        self,
+        input_file,
+        output_folder,
+        store_mode="none",
+        encoder_fn=None,
+        vector_db="chroma",
+        collection_name="documents",
+        skip_existing=True,
+    ):
+        ext = os.path.splitext(input_file)[1].lower()
+        base_name = os.path.basename(input_file)
+        output_txt = os.path.join(output_folder, f"{base_name}.txt")
+        if skip_existing and os.path.exists(output_txt):
+            print(f"Skipping already processed file: {base_name}")
+            return None
+        results = []
+        if ext == ".pdf" or ext in {".png", ".jpg", ".jpeg", ".tiff", ".bmp"}:
+            if ext == ".pdf":
+                pages = self.segment_pdf(input_file)
+            else:
+                pages = [Image.open(input_file).convert("RGB")]
+            results = self.extract_structured_content(pages)
+        elif ext in {".xlsx", ".xls", ".csv"}:
+            results = extract_tabular_to_markdown_pages(input_file)
+        elif ext in {".doc", ".docx", ".txt"}:
+            text = extract_plain_text(input_file)
+            results = [text]
+        else:
+            # Fallback: convert to images and use VLM (via PDF rendering)
+            pages = self.convert_to_images(input_file, output_folder)
+            results = self.extract_structured_content(pages)
+
+        with open(output_txt, "w") as f:
+            f.write("\n\n".join(results))
+
+        self.store_outputs(
+            results,
+            output_folder,
+            base_name,
+            store_mode=store_mode,
+            encoder_fn=encoder_fn,
+            vector_db=vector_db,
+            collection_name=collection_name,
+        )
+        return results
 
     def store_outputs(
         self,
@@ -288,37 +344,117 @@ class OpenaiVLMDataDigester(DataDigester):
                 "openai package is required for OpenaiVLMDataDigester. "
                 "Install it with: pip install openai"
             ) from exc
+
         client = OpenAI()
         extracted_data = []
+
         prompt = (
             "Extract the entire page and convert it to a single Markdown document. "
             "Preserve structure, headings, lists, and tables (as Markdown tables). "
             "Do not invent content."
         )
+
         for img in images:
             image_b64 = _pil_to_png_base64(img)
-            response = client.responses.create(
+
+            # Use the correct completions endpoint
+            response = client.chat.completions.create(
                 model=self.model_name,
-                input=[
+                messages=[  # Use 'messages' instead of 'input'
                     {
                         "role": "user",
                         "content": [
-                            {"type": "input_text", "text": prompt},
-                            {"type": "input_image", "image_data": image_b64},
+                            {
+                                "type": "text",  # Standardize to 'text'
+                                "text": prompt
+                            },
+                            {
+                                "type": "image_url",  # Standardize to 'image_url'
+                                "image_url": {
+                                    # Nest the base64 string inside the 'url' key
+                                    "url": f"data:image/png;base64,{image_b64}"
+                                }
+                            },
                         ],
                     }
                 ],
             )
-            extracted_data.append(response.output_text.strip())
+
+            # Parse the standard chat completion response format
+            content = response.choices[0].message.content.strip()
+            extracted_data.append(content)
+
         return extracted_data
 
 
-def _pil_to_png_base64(img):
-    import io
-
+def _pil_to_png_base64(img, max_dimension=2048):
+    """
+    Converts a PIL Image to a base64 PNG, resizing if necessary to optimize 
+    for VLM API token limits and payload constraints.
+    """
+    width, height = img.size
+    
+    # 1. Cap the maximum dimension to prevent unnecessary token bloat
+    if max(width, height) > max_dimension:
+        scaling_factor = max_dimension / float(max(width, height))
+        new_size = (int(width * scaling_factor), int(height * scaling_factor))
+        
+        # 2. Use LANCZOS resampling. It is slightly slower than standard resize 
+        # but crucial for preserving the sharpness of small document text.
+        img = img.resize(new_size, Image.Resampling.LANCZOS)
+    
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    
+    # 3. Add optimize=True to reduce the base64 string size 
+    # without losing visual fidelity.
+    img.save(buf, format="PNG", optimize=True)
+    
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def extract_tabular_to_markdown_pages(input_file):
+    try:
+        import pandas as pd
+    except Exception as exc:
+        raise RuntimeError(
+            "pandas is required for xlsx/xls/csv extraction. Install with: pip install pandas"
+        ) from exc
+    ext = os.path.splitext(input_file)[1].lower()
+    pages = []
+    if ext == ".csv":
+        df = pd.read_csv(input_file)
+        pages.append(df.to_markdown(index=False))
+        return pages
+    sheets = pd.read_excel(input_file, sheet_name=None)
+    for sheet_name, df in sheets.items():
+        header = f"# Sheet: {sheet_name}"
+        pages.append(f"{header}\n\n{df.to_markdown(index=False)}")
+    return pages
+
+
+def extract_plain_text(input_file):
+    ext = os.path.splitext(input_file)[1].lower()
+    if ext == ".txt":
+        with open(input_file, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    if ext == ".docx":
+        try:
+            import docx
+        except Exception as exc:
+            raise RuntimeError(
+                "python-docx is required for .docx extraction. Install with: pip install python-docx"
+            ) from exc
+        doc = docx.Document(input_file)
+        return "\n".join(p.text for p in doc.paragraphs)
+    if ext == ".doc":
+        try:
+            import textract
+        except Exception as exc:
+            raise RuntimeError(
+                "textract is required for .doc extraction. Install with: pip install textract"
+            ) from exc
+        return textract.process(input_file).decode("utf-8", errors="ignore")
+    raise ValueError(f"Unsupported text file type: {ext}")
 
 
 def encode_with_colbert(texts, model_name="colbert-ir/colbertv2.0", device="cpu"):
@@ -356,31 +492,22 @@ def main(
     encoder_fn=None,
     vector_db="chroma",
     collection_name="documents",
+    skip_existing=True,
 ):
     for filename in os.listdir(input_folder):
         input_file = os.path.join(input_folder, filename)
         if os.path.isfile(input_file):
-            # 1. Convert & Segment
-            temp_pdf = os.path.join(output_folder, f"{os.path.splitext(filename)[0]}.pdf")
-            pdf_path = digester.convert_to_pdf(input_file, temp_pdf)
-            pages = digester.segment_pdf(pdf_path)
-            
-            # 2. Extract
-            results = digester.extract_structured_content(pages)
-            
-            # Save results
-            with open(os.path.join(output_folder, f"{filename}.txt"), "w") as f:
-                f.write("\n\n".join(results))
-            digester.store_outputs(
-                results,
+            print(f"Processing {filename}")
+            digester.process_file(
+                input_file,
                 output_folder,
-                filename,
                 store_mode=store_mode,
                 encoder_fn=encoder_fn,
                 vector_db=vector_db,
                 collection_name=collection_name,
+                skip_existing=skip_existing,
             )
-            print(f"Finished processing {filename}")
+            print(f"Finished Processing {filename}")
 
 
 if __name__ == "__main__":
@@ -393,6 +520,7 @@ if __name__ == "__main__":
     parser.add_argument("--store_mode", type=str, default="none", help="none|json|vector")
     parser.add_argument("--vector_db", type=str, default="chroma", help="chroma|qdrant")
     parser.add_argument("--collection", type=str, default="documents", help="Vector DB collection name")
+    parser.add_argument("--skip_existing", action="store_true", help="Skip files already processed")
     parser.add_argument("input_pos", nargs="?", help="Positional input folder")
     parser.add_argument("output_pos", nargs="?", help="Positional output folder")
     args = parser.parse_args()
@@ -412,4 +540,5 @@ if __name__ == "__main__":
         encoder_fn=None,
         vector_db=args.vector_db,
         collection_name=args.collection,
+        skip_existing=args.skip_existing,
     )

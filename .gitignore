@@ -2,3 +2,4 @@
 *.pdf
 
 /data
+.env
